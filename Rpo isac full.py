@@ -1,622 +1,259 @@
 """
-RPO-ISAC Level 1 FIM — Complete Verification + CRB Curves
-===========================================================
-Single-file script: run locally, paste terminal output back.
+EuRAD 2026 — OFDM Radar for RPO Tumbling Target
+=================================================
+Generates 5 figures for 4-page EuRAD paper (radar-centric framing).
 
-Contents:
-  Phase 1: Analytical vs finite-difference derivative verification (small N,M)
-  Phase 2: FIM with phi_0 nuisance parameter + Schur complement
-  Phase 3: Full-parameter CRB curves (N=1024, M=781)
-    - Fig 1: CRB vs distance (0.5–25 km)
-    - Fig 2: CRB vs spin rate (0.1–10 deg/s)
-    - Fig 3: CRB vs pilot ratio (sensing–comm tradeoff)
-    - Fig 4: CRB vs number of scatterers K
+Fig 1: CRB(Ω) vs distance (K=1,2,5,10) + CRB(d) vs Gaudio baseline
+Fig 2: CRB vs K (averaged, with shading)
+Fig 3: Design guidelines — CRB vs bandwidth + CPI (two-panel)
+Fig 4: CRB vs spin rate (absolute + relative)
+Fig 5: Link budget validation (SNR vs distance)
 
-Usage:
-  python rpo_isac_full.py
-
-Output:
-  - Terminal log with all numerical checks
-  - rpo_isac_crb_curves.png (4-panel figure)
-
-Author: Haofan + Claude, March 2026
+Run:   python rpo_eurad_figures.py [--full]
+Output: eurad/fig/*.pdf + eurad/fig/all_figures.png
 """
 
 import numpy as np
-import matplotlib.pyplot as plt
 import matplotlib
-import time
+import matplotlib.pyplot as plt
+import os, sys, time
 
+FAST = '--full' not in sys.argv
+FIG_DIR = 'eurad/fig'
+os.makedirs(FIG_DIR, exist_ok=True)
+
+# === IEEE/EuRAD Style ===
+IW, IH, FS, LFS, TFS = 3.4, 2.5, 9, 7, 8
 matplotlib.rcParams.update({
-    'font.size': 11,
-    'figure.dpi': 150,
-    'font.family': 'serif',
-    'mathtext.fontset': 'cm',
+    'font.family':'serif','font.serif':['Times New Roman','Times','DejaVu Serif'],
+    'mathtext.fontset':'cm','font.size':FS,'axes.labelsize':FS,
+    'xtick.labelsize':TFS,'ytick.labelsize':TFS,'legend.fontsize':LFS,
+    'figure.dpi':300,'savefig.dpi':300,'savefig.bbox':'tight','savefig.pad_inches':0.02,
+    'lines.linewidth':1.2,'lines.markersize':4,'axes.linewidth':0.6,
+    'grid.linewidth':0.4,'grid.alpha':0.3,
 })
+CB='#0072B2'; CR='#D55E00'; CG='#009E73'; CO='#E69F00'; CP='#CC79A7'; CC='#56B4E9'
 
-# ============================================================
-# Physical Constants & System Parameters (Table I)
-# ============================================================
-c = 3e8
-k_B = 1.38e-23
+# === System Parameters ===
+c=3e8; kB=1.38e-23; fc=26e9; lam=c/fc; B=20e6; eta=0.6
+N=256 if FAST else 1024
+Df=B/N; Ts=(1/Df)*1.25; M=max(1,int(0.05/Ts))
+if FAST and M>200: M=200
+Tcpi=M*Ts; Pt=30; Ds=0.5; Gs=eta*(np.pi*Ds/lam)**2
+L=10**(6/10); Tss=500; sw2=kB*Tss*Df; vr0=-0.5; Om0=np.deg2rad(2.0)
 
-# Baseline parameters
-PARAMS = {
-    'f_c': 26e9,  # Ka-band
-    'B': 20e6,  # bandwidth
-    'N': 1024,  # subcarriers (full)
-    'M': 781,  # OFDM symbols per CPI (full)
-    'P_t': 30,  # transmit power [W]
-    'D_ant': 0.5,  # antenna diameter [m]
-    'eta_ant': 0.6,  # antenna efficiency
-    'T_sys': 500,  # system noise temp [K]
-    'L_dB': 6.0,  # total system losses [dB]
-    'CP_ratio': 0.25,  # CP / useful symbol duration → T_sym ≈ 64 μs
-}
+wh=np.array([0.,0.,1.]); nh=np.array([1.,0.,0.])
+def skew(v): return np.array([[0,-v[2],v[1]],[v[2],0,-v[0]],[-v[1],v[0],0]])
+Km=skew(wh); K2=Km@Km
+def Rrod(t): return np.eye(3)+np.sin(t)*Km+(1-np.cos(t))*K2
+def Rdot(t): return np.cos(t)*Km+np.sin(t)*K2
 
+def gen_target(Ksc,seed=42):
+    rng=np.random.RandomState(seed)
+    return rng.randn(Ksc,3)*2.0,(rng.randn(Ksc)+1j*rng.randn(Ksc))/np.sqrt(2)
 
-def derived_params(p, N_override=None, M_override=None):
-    """Compute derived parameters from base params."""
-    N = N_override or p['N']
-    M = M_override or p['M']
-    lam = c / p['f_c']
-    Delta_f = p['B'] / N
-    T = 1.0 / Delta_f
-    T_cp = T * p['CP_ratio']
-    T_sym = T + T_cp
-    T_cpi = M * T_sym
-    G_ant = p['eta_ant'] * (np.pi * p['D_ant'] / lam) ** 2
-    L = 10 ** (p['L_dB'] / 10)
-    sigma_w2 = k_B * p['T_sys'] * Delta_f
-    return {
-        'lam': lam, 'N': N, 'M': M, 'Delta_f': Delta_f,
-        'T_sym': T_sym, 'T_cpi': T_cpi, 'G_ant': G_ant,
-        'L': L, 'sigma_w2': sigma_w2, 'f_c': p['f_c'],
-        'P_t': p['P_t'], 'B': p['B'],
-    }
-
-
-# ============================================================
-# Rotation Matrix Utilities
-# ============================================================
-def skew(v):
-    return np.array([[0, -v[2], v[1]],
-                     [v[2], 0, -v[0]],
-                     [-v[1], v[0], 0]])
-
-
-def R_rodrigues(theta, K_mat, K2):
-    return np.eye(3) + np.sin(theta) * K_mat + (1 - np.cos(theta)) * K2
-
-
-def R_dot(theta, K_mat, K2):
-    return np.cos(theta) * K_mat + np.sin(theta) * K2
-
-
-# ============================================================
-# Target Generation
-# ============================================================
-def generate_target(K_sc, seed=42):
-    """Generate random scattering centers."""
-    rng = np.random.RandomState(seed)
-    p_k = rng.randn(K_sc, 3) * 2.0  # ~2m spread
-    sigma_k = (rng.randn(K_sc) + 1j * rng.randn(K_sc)) / np.sqrt(2)
-    omega_hat = np.array([0.0, 0.0, 1.0])
-    n_hat = np.array([1.0, 0.0, 0.0])
-    return p_k, sigma_k, omega_hat, n_hat
-
-
-# ============================================================
-# Core: Compute signal h(theta) and partial derivatives
-# ============================================================
-def compute_h_and_derivs(d, v_r, Omega, dp, p_k, sigma_k, omega_hat, n_hat,
-                         compute_derivs=True):
-    """
-    Compute h(theta) and optionally dh/d[d, v_r, Omega, phi_0].
-
-    Returns:
-        h: complex array [N*M]
-        derivs: dict with keys 'dd', 'dvr', 'dO', 'dphi0' (if compute_derivs)
-    """
-    N = dp['N']
-    M = dp['M']
-    f_c = dp['f_c']
-    Delta_f = dp['Delta_f']
-    T_sym = dp['T_sym']
-    P_t = dp['P_t']
-    G = dp['G_ant']
-    L = dp['L']
-    lam = dp['lam']
-
-    K_sc = len(sigma_k)
-    K_mat = skew(omega_hat)
-    K2 = K_mat @ K_mat
-
-    beta = np.sqrt(P_t * G * G * lam ** 2 / ((4 * np.pi) ** 3 * d ** 4 * L))
-    tau_0 = 2.0 * d / c
-    phi_0_val = 2 * np.pi * f_c * tau_0
-    f_d = -2.0 * v_r * f_c / c
-
-    NM = N * M
-    h = np.zeros(NM, dtype=complex)
-
-    if compute_derivs:
-        dh_dd = np.zeros(NM, dtype=complex)
-        dh_dvr = np.zeros(NM, dtype=complex)
-        dh_dO = np.zeros(NM, dtype=complex)
-        dh_dphi0 = np.zeros(NM, dtype=complex)
-
-    # Precompute subcarrier frequencies (baseband index only)
-    n_arr = np.arange(N)
-    f_n_arr = f_c + n_arr * Delta_f  # absolute freq per subcarrier
-
-    # Precompute baseband phase slope for range
-    phase_range_arr = -2 * np.pi * n_arr * Delta_f * tau_0  # [N]
-
+def compute_crb(Ps,d,vr,Om,pk,sk):
+    Ksc=len(sk); beta=np.sqrt(Ps*Gs**2*lam**2/((4*np.pi)**3*d**4*L))
+    t0=2*d/c; p0=2*np.pi*fc*t0; fd=-2*vr*fc/c; ab=beta*sk*np.exp(-1j*p0)
+    na=np.arange(N); fn=fc+na*Df; phr=-2*np.pi*na*Df*t0; NM=N*M
+    dh={k:np.zeros(NM,dtype=complex) for k in ['dd','dv','dO','dp']}
     for m in range(M):
-        t_m = m * T_sym
-        theta_m = Omega * t_m
-        R_m = R_rodrigues(theta_m, K_mat, K2)
+        tm=m*Ts; thm=Om*tm; Rm=Rrod(thm); Rd=Rdot(thm)
+        phd=2*np.pi*fd*tm; sl=slice(m*N,(m+1)*N)
+        for k in range(Ksc):
+            dtk=(2/c)*(nh@Rm@pk[k]); ddO=(2/c)*tm*(nh@Rd@pk[k])
+            phm=-2*np.pi*fn*dtk; gk=ab[k]*np.exp(1j*(-p0+phr+phd+phm))
+            dh['dd'][sl]+=(-1j*4*np.pi*na*Df/c)*gk
+            dh['dv'][sl]+=(-1j*4*np.pi*fc*tm/c)*gk
+            dh['dO'][sl]+=(-1j*2*np.pi*fn*ddO)*gk; dh['dp'][sl]+=(-1j)*gk
+    ks=['dd','dv','dO','dp']; J=np.zeros((4,4))
+    for i in range(4):
+        for j in range(i,4):
+            J[i,j]=(2/sw2)*np.real(np.conj(dh[ks[i]])@dh[ks[j]]); J[j,i]=J[i,j]
+    J3=J[:3,:3]-J[:3,3:4]@J[3:4,:3]/J[3,3]
+    try: return np.sqrt(np.diag(np.linalg.inv(J3)))
+    except: return np.array([np.inf,np.inf,np.inf])
 
-        if compute_derivs:
-            Rd_m = R_dot(theta_m, K_mat, K2)
+pk1,sk1=gen_target(1); pk2,sk2=gen_target(2)
+pk5,sk5=gen_target(5); pk10,sk10=gen_target(10)
 
-        phase_doppler = 2 * np.pi * f_d * t_m  # scalar
-
-        idx_start = m * N
-        idx_end = idx_start + N
-
-        for k in range(K_sc):
-            delta_tau_k = (2.0 / c) * (n_hat @ R_m @ p_k[k])
-
-            # Phase: carrier + baseband_range + doppler + micro
-            phase_carrier = -phi_0_val
-            phase_micro_arr = -2 * np.pi * f_n_arr * delta_tau_k  # [N]
-
-            total_phase = phase_carrier + phase_range_arr + phase_doppler + phase_micro_arr
-            g_k_arr = beta * sigma_k[k] * np.exp(1j * total_phase)  # [N]
-
-            h[idx_start:idx_end] += g_k_arr
-
-            if compute_derivs:
-                # dh/dd: baseband only (phi_0 separated)
-                dh_dd[idx_start:idx_end] += (-1j * 4 * np.pi * n_arr * Delta_f / c) * g_k_arr
-
-                # dh/dv_r
-                dh_dvr[idx_start:idx_end] += (-1j * 4 * np.pi * f_c * t_m / c) * g_k_arr
-
-                # dh/dOmega
-                d_delta_tau_dO = (2.0 / c) * t_m * (n_hat @ Rd_m @ p_k[k])
-                dh_dO[idx_start:idx_end] += (-1j * 2 * np.pi * f_n_arr * d_delta_tau_dO) * g_k_arr
-
-                # dh/dphi_0
-                dh_dphi0[idx_start:idx_end] += (-1j) * g_k_arr
-
-    if compute_derivs:
-        return h, {'dd': dh_dd, 'dvr': dh_dvr, 'dO': dh_dO, 'dphi0': dh_dphi0}
-    return h
-
+def savefig(name):
+    for ext in ['pdf','png']: plt.savefig(f'{FIG_DIR}/{name}.{ext}')
+    plt.close(); print(f"  {name}.pdf")
 
 # ============================================================
-# FIM Computation with Schur Complement
-# ============================================================
-def compute_fim_4x4(derivs, sigma_w2):
-    """Compute 4x4 FIM for [d, v_r, Omega, phi_0]."""
-    keys = ['dd', 'dvr', 'dO', 'dphi0']
-    P = 4
-    J = np.zeros((P, P))
-    for i in range(P):
-        for j in range(i, P):
-            J[i, j] = (2.0 / sigma_w2) * np.real(np.conj(derivs[keys[i]]) @ derivs[keys[j]])
-            J[j, i] = J[i, j]
-    return J
-
-
-def marginalize_phi0(J4):
-    """Schur complement: marginalize phi_0 from 4x4 FIM -> 3x3."""
-    J_theta = J4[:3, :3]
-    J_cross = J4[:3, 3:4]
-    J_phi = J4[3, 3]
-    return J_theta - J_cross @ J_cross.T / J_phi
-
-
-def crb_from_fim(J3):
-    """CRB = sqrt(diag(J^{-1}))."""
-    try:
-        J_inv = np.linalg.inv(J3)
-        return np.sqrt(np.diag(J_inv)), J_inv
-    except np.linalg.LinAlgError:
-        return np.array([np.inf, np.inf, np.inf]), None
-
-
-# ============================================================
-# PHASE 1: Derivative Verification (small N, M)
-# ============================================================
-def phase1_verify():
-    print("\n" + "=" * 70)
-    print("PHASE 1: DERIVATIVE VERIFICATION (N=128, M=64)")
-    print("=" * 70)
-
-    dp = derived_params(PARAMS, N_override=128, M_override=64)
-    p_k, sigma_k, omega_hat, n_hat = generate_target(5)
-
-    d0, vr0, Om0 = 5e3, -0.5, np.deg2rad(2.0)
-
-    # Analytical
-    _, derivs_a = compute_h_and_derivs(d0, vr0, Om0, dp, p_k, sigma_k, omega_hat, n_hat)
-
-    # Numerical: for d, FD gives TOTAL derivative (phi_0 co-varies with d)
-    # Our analytical gives PARTIAL derivatives with phi_0 separated.
-    # So we verify: (1) v_r and Omega partials directly,
-    #               (2) the MARGINALIZED 3x3 FIM and CRB (which must match regardless)
-    eps = {'d': 1e-6, 'vr': 1e-6, 'Om': 1e-5}  # Om eps larger: small CPI → tiny rotation angle
-
-    h_vp = compute_h_and_derivs(d0, vr0 + eps['vr'], Om0, dp, p_k, sigma_k, omega_hat, n_hat, False)
-    h_vm = compute_h_and_derivs(d0, vr0 - eps['vr'], Om0, dp, p_k, sigma_k, omega_hat, n_hat, False)
-    dh_dvr_n = (h_vp - h_vm) / (2 * eps['vr'])
-
-    h_Op = compute_h_and_derivs(d0, vr0, Om0 + eps['Om'], dp, p_k, sigma_k, omega_hat, n_hat, False)
-    h_Om = compute_h_and_derivs(d0, vr0, Om0 - eps['Om'], dp, p_k, sigma_k, omega_hat, n_hat, False)
-    dh_dO_n = (h_Op - h_Om) / (2 * eps['Om'])
-
-    print("\n  Derivative comparison (analytical vs finite-difference):")
-    print("  Note: dh/dd not compared directly (our formulation separates phi_0;")
-    print("        FD computes total derivative). Verified via FIM instead.\n")
-
-    pairs = [('dh/dv_r', derivs_a['dvr'], dh_dvr_n),
-             ('dh/dΩ', derivs_a['dO'], dh_dO_n)]
-
-    all_pass = True
-    for name, da, dn in pairs:
-        rel = np.linalg.norm(da - dn) / (np.linalg.norm(dn) + 1e-30)
-        status = "✅ PASS" if rel < 1e-3 else "⚠️ FAIL"
-        if rel >= 1e-3:
-            all_pass = False
-        print(f"    {name:>8}: rel_err = {rel:.2e}  {status}")
-
-    # FIM verification: compute "total-derivative" FIM numerically and compare CRB
-    # The total derivative dh/dd_total = dh/dd_partial + (dphi_0/dd) * dh/dphi_0
-    # where dphi_0/dd = 4*pi*f_c/c
-    dphi0_dd = 4 * np.pi * dp['f_c'] / c
-    dh_dd_total_from_analytical = derivs_a['dd'] + dphi0_dd * derivs_a['dphi0']
-
-    h_dp = compute_h_and_derivs(d0 + eps['d'], vr0, Om0, dp, p_k, sigma_k, omega_hat, n_hat, False)
-    h_dm = compute_h_and_derivs(d0 - eps['d'], vr0, Om0, dp, p_k, sigma_k, omega_hat, n_hat, False)
-    dh_dd_total_numerical = (h_dp - h_dm) / (2 * eps['d'])
-
-    rel_dd = np.linalg.norm(dh_dd_total_from_analytical - dh_dd_total_numerical) / \
-             (np.linalg.norm(dh_dd_total_numerical) + 1e-30)
-    status_dd = "✅ PASS" if rel_dd < 1e-3 else "⚠️ FAIL"
-    if rel_dd >= 1e-3:
-        all_pass = False
-    print(f"    {'dh/dd':>8}: rel_err = {rel_dd:.2e}  {status_dd}  (total = partial + dphi0/dd * dh/dphi0)")
-
-    # FIM comparison
-    J4_a = compute_fim_4x4(derivs_a, dp['sigma_w2'])
-    J3_a = marginalize_phi0(J4_a)
-
-    print("\n  FIM element comparison (marginalized 3×3):")
-    # Reconstruct numerical FIM using total derivatives
-    derivs_n_total = {'dd': dh_dd_total_numerical, 'dvr': dh_dvr_n, 'dO': dh_dO_n, 'dphi0': derivs_a['dphi0']}
-    J4_n = compute_fim_4x4(derivs_n_total, dp['sigma_w2'])
-    J3_n = marginalize_phi0(J4_n)
-
-    names_3 = ['d', 'v_r', 'Ω']
-    for i in range(3):
-        for j in range(i, 3):
-            rel = abs(J3_a[i, j] - J3_n[i, j]) / (abs(J3_n[i, j]) + 1e-30)
-            status = "✅" if rel < 2e-2 else "⚠️"  # 2% threshold for small N,M verification
-            print(
-                f"    J_{names_3[i]},{names_3[j]}: analytical={J3_a[i, j]:.4e}, numerical={J3_n[i, j]:.4e}, rel_err={rel:.2e} {status}")
-            if rel >= 2e-2:
-                all_pass = False
-
-    crb_vals, _ = crb_from_fim(J3_a)
-    print(f"\n  CRB (N=128, M=64, d=5km):")
-    print(f"    CRB(d)   = {crb_vals[0] * 1e3:.4f} mm")
-    print(f"    CRB(v_r) = {crb_vals[1] * 1e3:.4f} mm/s")
-    print(f"    CRB(Ω)   = {np.rad2deg(crb_vals[2]):.6f} deg/s")
-
-    # Sanity: compare with Gaudio
-    alpha_eff = np.sqrt(PARAMS['P_t'] * dp['G_ant'] ** 2 * dp['lam'] ** 2 /
-                        ((4 * np.pi) ** 3 * d0 ** 4 * dp['L'])) * np.sqrt(np.sum(np.abs(sigma_k) ** 2))
-    crb_d_gaudio = (c / 2) * np.sqrt(6 * dp['sigma_w2'] /
-                                     (alpha_eff ** 2 * (2 * np.pi * dp['Delta_f']) ** 2 * dp['N'] * dp['M'] * (
-                                                 dp['N'] ** 2 - 1)))
-    crb_vr_gaudio = (dp['lam'] / 2) * np.sqrt(6 * dp['sigma_w2'] /
-                                              (alpha_eff ** 2 * (2 * np.pi * dp['T_sym']) ** 2 * dp['N'] * dp['M'] * (
-                                                          dp['M'] ** 2 - 1)))
-
-    print(f"\n  Gaudio et al. (point target) reference:")
-    print(f"    CRB(d)   = {crb_d_gaudio * 1e3:.4f} mm  (ours/Gaudio = {crb_vals[0] / crb_d_gaudio:.3f}x)")
-    print(f"    CRB(v_r) = {crb_vr_gaudio * 1e3:.4f} mm/s  (ours/Gaudio = {crb_vals[1] / crb_vr_gaudio:.3f}x)")
-
-    eigvals = np.linalg.eigvalsh(J3_a)
-    print(f"\n  FIM eigenvalues: {eigvals}")
-    print(f"  Condition number: {eigvals[-1] / eigvals[0]:.2e}")
-
-    if all_pass:
-        print("\n  ✅✅✅ PHASE 1 ALL CHECKS PASSED ✅✅✅")
-    else:
-        print("\n  ⚠️⚠️⚠️ PHASE 1 HAS FAILURES ⚠️⚠️⚠️")
-
-    return all_pass
-
-
-# ============================================================
-# PHASE 2: Full-Parameter CRB Curves
-# ============================================================
-def phase2_crb_curves():
-    print("\n" + "=" * 70)
-    print("PHASE 2: FULL-PARAMETER CRB CURVES (N=1024, M=781)")
-    print("=" * 70)
-
-    dp_full = derived_params(PARAMS)
-    p_k, sigma_k, omega_hat, n_hat = generate_target(5)
-
-    print(f"  N={dp_full['N']}, M={dp_full['M']}, T_cpi={dp_full['T_cpi'] * 1e3:.1f} ms")
-    print(f"  Total SNR integration: N*M = {dp_full['N'] * dp_full['M']}")
-
-    # ---- Fig 1: CRB vs Distance ----
-    print("\n  [Fig 1] CRB vs Distance...")
-    d_arr = np.linspace(0.5e3, 25e3, 30)
-    vr_fix = -0.5
-    Om_fix = np.deg2rad(2.0)
-
-    crb_d_vs_dist = []
-    crb_vr_vs_dist = []
-    crb_Om_vs_dist = []
-
-    t0 = time.time()
-    for i, d_val in enumerate(d_arr):
-        _, derivs = compute_h_and_derivs(d_val, vr_fix, Om_fix, dp_full, p_k, sigma_k, omega_hat, n_hat)
-        J4 = compute_fim_4x4(derivs, dp_full['sigma_w2'])
-        J3 = marginalize_phi0(J4)
-        crb, _ = crb_from_fim(J3)
-        crb_d_vs_dist.append(crb[0])
-        crb_vr_vs_dist.append(crb[1])
-        crb_Om_vs_dist.append(crb[2])
-        if (i + 1) % 10 == 0:
-            print(f"    {i + 1}/{len(d_arr)} done ({time.time() - t0:.1f}s)")
-
-    crb_d_vs_dist = np.array(crb_d_vs_dist)
-    crb_vr_vs_dist = np.array(crb_vr_vs_dist)
-    crb_Om_vs_dist = np.array(crb_Om_vs_dist)
-
-    print(f"    Completed in {time.time() - t0:.1f}s")
-    print(f"    CRB(d)  @ 1km: {crb_d_vs_dist[0] * 1e6:.2f} μm, @ 25km: {crb_d_vs_dist[-1] * 1e3:.4f} mm")
-    print(f"    CRB(v_r) @ 1km: {crb_vr_vs_dist[0] * 1e6:.2f} μm/s, @ 25km: {crb_vr_vs_dist[-1] * 1e3:.4f} mm/s")
-    print(
-        f"    CRB(Ω)  @ 1km: {np.rad2deg(crb_Om_vs_dist[0]):.6f} deg/s, @ 25km: {np.rad2deg(crb_Om_vs_dist[-1]):.6f} deg/s")
-
-    # ---- Fig 2: CRB vs Spin Rate ----
-    print("\n  [Fig 2] CRB vs Spin Rate...")
-    Om_arr = np.deg2rad(np.linspace(0.1, 10, 25))
-    d_fix = 5e3
-
-    crb_Om_vs_spin = []
-    crb_d_vs_spin = []
-
-    t0 = time.time()
-    for i, Om_val in enumerate(Om_arr):
-        _, derivs = compute_h_and_derivs(d_fix, vr_fix, Om_val, dp_full, p_k, sigma_k, omega_hat, n_hat)
-        J4 = compute_fim_4x4(derivs, dp_full['sigma_w2'])
-        J3 = marginalize_phi0(J4)
-        crb, _ = crb_from_fim(J3)
-        crb_Om_vs_spin.append(crb[2])
-        crb_d_vs_spin.append(crb[0])
-        if (i + 1) % 10 == 0:
-            print(f"    {i + 1}/{len(Om_arr)} done ({time.time() - t0:.1f}s)")
-
-    crb_Om_vs_spin = np.array(crb_Om_vs_spin)
-    crb_d_vs_spin = np.array(crb_d_vs_spin)
-    print(f"    Completed in {time.time() - t0:.1f}s")
-
-    # ---- Fig 3: CRB vs Pilot Ratio (Sensing-Comm Tradeoff) ----
-    print("\n  [Fig 3] CRB vs Pilot Ratio (Sensing-Comm Tradeoff)...")
-    rho_arr = np.linspace(0.05, 0.95, 20)
-
-    crb_d_vs_rho = []
-    crb_Om_vs_rho = []
-    rate_vs_rho = []
-
-    t0 = time.time()
-    for i, rho in enumerate(rho_arr):
-        N_p = max(1, int(rho * dp_full['N']))
-        N_d = dp_full['N'] - N_p
-
-        # For sensing: with pilot-only mode, N_eff = N_p subcarriers
-        # With monostatic ISAC: all N subcarriers contribute (data is known)
-        # The pilot ratio affects ONLY communication rate, not sensing CRB
-        # But if we consider a bistatic scenario or partial knowledge,
-        # only pilots contribute deterministically.
-        #
-        # For THIS analysis (monostatic, data known at Tx):
-        # CRB is independent of rho! All subcarriers sense.
-        # The tradeoff is: rho affects ONLY comm rate.
-        #
-        # For a fair comparison, we also compute "pilot-only sensing CRB"
-        # where only N_p subcarriers are used.
-
-        # Full monostatic CRB (all N subcarriers, rho-independent)
-        _, derivs = compute_h_and_derivs(d_fix, vr_fix, Om_fix, dp_full, p_k, sigma_k, omega_hat, n_hat)
-        J4 = compute_fim_4x4(derivs, dp_full['sigma_w2'])
-        J3 = marginalize_phi0(J4)
-        crb_full, _ = crb_from_fim(J3)
-
-        # Pilot-only CRB (use only N_p subcarriers)
-        dp_pilot = derived_params(PARAMS, N_override=N_p, M_override=dp_full['M'])
-        if N_p >= 2:
-            _, derivs_p = compute_h_and_derivs(d_fix, vr_fix, Om_fix, dp_pilot, p_k, sigma_k, omega_hat, n_hat)
-            J4_p = compute_fim_4x4(derivs_p, dp_pilot['sigma_w2'])
-            J3_p = marginalize_phi0(J4_p)
-            crb_pilot, _ = crb_from_fim(J3_p)
-        else:
-            crb_pilot = np.array([np.inf, np.inf, np.inf])
-
-        crb_d_vs_rho.append((crb_full[0], crb_pilot[0]))
-        crb_Om_vs_rho.append((crb_full[2], crb_pilot[2]))
-
-        # Comm rate (Shannon, AWGN, using data subcarriers only)
-        H_c_power = dp_full['P_t'] * dp_full['G_ant'] * 10 ** (35 / 10) * dp_full['lam'] ** 2 / \
-                    ((4 * np.pi * 2000e3) ** 2 * dp_full['L'])  # direct-to-ground
-        snr_c = H_c_power / (k_B * 300 * dp_full['Delta_f'])
-        rate = N_d / dp_full['N'] * np.log2(1 + snr_c) * dp_full['B'] / 1e6  # Mbps
-        rate_vs_rho.append(rate)
-
-        if (i + 1) % 10 == 0:
-            print(f"    {i + 1}/{len(rho_arr)} done ({time.time() - t0:.1f}s)")
-
-    crb_d_vs_rho = np.array(crb_d_vs_rho)
-    crb_Om_vs_rho = np.array(crb_Om_vs_rho)
-    rate_vs_rho = np.array(rate_vs_rho)
-    print(f"    Completed in {time.time() - t0:.1f}s")
-
-    # ---- Fig 4: CRB vs K (number of scatterers) ----
-    print("\n  [Fig 4] CRB vs K (number of scatterers)...")
-    K_arr = [1, 2, 3, 5, 8, 10, 15]
-    crb_Om_vs_K = []
-    crb_d_vs_K = []
-
-    t0 = time.time()
-    for K_val in K_arr:
-        pk, sk, wh, nh = generate_target(K_val, seed=42)
-        _, derivs = compute_h_and_derivs(d_fix, vr_fix, Om_fix, dp_full, pk, sk, wh, nh)
-        J4 = compute_fim_4x4(derivs, dp_full['sigma_w2'])
-        J3 = marginalize_phi0(J4)
-        crb, _ = crb_from_fim(J3)
-        crb_Om_vs_K.append(crb[2])
-        crb_d_vs_K.append(crb[0])
-        print(f"    K={K_val:>2}: CRB(Ω)={np.rad2deg(crb[2]):.6f} deg/s, CRB(d)={crb[0] * 1e3:.4f} mm")
-
-    crb_Om_vs_K = np.array(crb_Om_vs_K)
-    crb_d_vs_K = np.array(crb_d_vs_K)
-    print(f"    Completed in {time.time() - t0:.1f}s")
-
-    # ============================================================
-    # PLOTTING
-    # ============================================================
-    print("\n  Generating plots...")
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    fig.suptitle('RPO-ISAC Level 1 CRB Analysis (Ka-band, 26 GHz, 20 MHz BW)', fontsize=14, fontweight='bold')
-
-    # Fig 1: CRB vs Distance
-    ax = axes[0, 0]
-    ax.semilogy(d_arr / 1e3, crb_d_vs_dist * 1e3, 'b-o', markersize=3, label='CRB($d$) [mm]')
-    ax.semilogy(d_arr / 1e3, crb_vr_vs_dist * 1e3, 'r-s', markersize=3, label='CRB($v_r$) [mm/s]')
-    ax.semilogy(d_arr / 1e3, np.rad2deg(crb_Om_vs_dist) * 1e3, 'g-^', markersize=3, label=r'CRB($\Omega$) [mdeg/s]')
-    ax.set_xlabel('Distance [km]')
-    ax.set_ylabel('CRB')
-    ax.set_title(f'CRB vs Distance ($v_r$={vr_fix} m/s, $\\Omega$={np.rad2deg(Om_fix):.0f}°/s, K={len(sigma_k)})')
-    ax.legend(fontsize=9)
-    ax.grid(True, alpha=0.3)
-    ax.set_xlim([0.5, 25])
-
-    # Fig 2: CRB(Omega) vs Spin Rate
-    ax = axes[0, 1]
-    ax.semilogy(np.rad2deg(Om_arr), np.rad2deg(crb_Om_vs_spin), 'g-^', markersize=4, label=r'CRB($\Omega$)')
-    ax.set_xlabel('Spin Rate [deg/s]')
-    ax.set_ylabel(r'CRB($\Omega$) [deg/s]')
-    ax.set_title(f'CRB($\\Omega$) vs Spin Rate ($d$={d_fix / 1e3:.0f} km)')
-    ax.grid(True, alpha=0.3)
-    # Add relative accuracy on right y-axis
-    ax2 = ax.twinx()
-    rel_acc = crb_Om_vs_spin / Om_arr * 100
-    ax2.plot(np.rad2deg(Om_arr), rel_acc, 'k--', alpha=0.5, label='Relative [%]')
-    ax2.set_ylabel('Relative CRB [%]', color='gray')
-    ax2.tick_params(axis='y', labelcolor='gray')
-    ax.legend(loc='upper left', fontsize=9)
-    ax2.legend(loc='upper right', fontsize=9)
-
-    # Fig 3: Sensing-Comm Tradeoff
-    ax = axes[1, 0]
-    ax_rate = ax.twinx()
-
-    l1, = ax.semilogy(rho_arr * 100, np.rad2deg(crb_Om_vs_rho[:, 1]) * 1e3, 'g-^', markersize=4,
-                      label=r'CRB($\Omega$) pilot-only [mdeg/s]')
-    l1b, = ax.semilogy(rho_arr * 100, np.ones(len(rho_arr)) * np.rad2deg(crb_Om_vs_rho[0, 0]) * 1e3,
-                       'g--', alpha=0.5, label=r'CRB($\Omega$) monostatic [mdeg/s]')
-    l2, = ax_rate.plot(rho_arr * 100, rate_vs_rho, 'b-o', markersize=3, label='Comm Rate [Mbps]')
-
-    ax.set_xlabel('Pilot Ratio $\\rho = N_p/N$ [%]')
-    ax.set_ylabel(r'CRB($\Omega$) [mdeg/s]', color='green')
-    ax_rate.set_ylabel('Data Rate [Mbps]', color='blue')
-    ax.set_title('Sensing–Communication Tradeoff')
-    ax.tick_params(axis='y', labelcolor='green')
-    ax_rate.tick_params(axis='y', labelcolor='blue')
-    lines = [l1, l1b, l2]
-    ax.legend(lines, [l.get_label() for l in lines], fontsize=8, loc='center right')
-    ax.grid(True, alpha=0.3)
-
-    # Fig 4: CRB vs K
-    ax = axes[1, 1]
-    ax.semilogy(K_arr, np.rad2deg(crb_Om_vs_K), 'g-^', markersize=6, label=r'CRB($\Omega$)')
-    ax.semilogy(K_arr, crb_d_vs_K * 1e3, 'b-o', markersize=6, label='CRB($d$) [mm]')
-    ax.set_xlabel('Number of Scatterers $K$')
-    ax.set_ylabel('CRB')
-    ax.set_title(f'CRB vs $K$ ($d$={d_fix / 1e3:.0f} km, $\\Omega$={np.rad2deg(Om_fix):.0f}°/s)')
-    ax.legend(fontsize=9)
-    ax.grid(True, alpha=0.3)
-    ax.set_xticks(K_arr)
-
-    plt.tight_layout()
-    plt.savefig('rpo_isac_crb_curves.png', bbox_inches='tight')
-    plt.close()
-    print("  Saved: rpo_isac_crb_curves.png")
-
-
-# ============================================================
-# PHASE 3: Key Numerical Results Summary
-# ============================================================
-def phase3_summary():
-    print("\n" + "=" * 70)
-    print("PHASE 3: KEY RESULTS SUMMARY (Table for Paper)")
-    print("=" * 70)
-
-    dp = derived_params(PARAMS)
-    p_k, sigma_k, omega_hat, n_hat = generate_target(5)
-
-    print(
-        f"\n  {'Distance [km]':>15} | {'CRB(d) [mm]':>12} | {'CRB(v_r) [mm/s]':>16} | {'CRB(Ω) [deg/s]':>15} | {'CRB(Ω)/Ω [%]':>13}")
-    print(f"  {'-' * 80}")
-
-    Om_fix = np.deg2rad(2.0)
-    vr_fix = -0.5
-
-    for d_km in [0.5, 1, 2, 5, 10, 15, 25]:
-        d_val = d_km * 1e3
-        _, derivs = compute_h_and_derivs(d_val, vr_fix, Om_fix, dp, p_k, sigma_k, omega_hat, n_hat)
-        J4 = compute_fim_4x4(derivs, dp['sigma_w2'])
-        J3 = marginalize_phi0(J4)
-        crb, _ = crb_from_fim(J3)
-        rel_Om = crb[2] / Om_fix * 100
-        print(
-            f"  {d_km:>15.1f} | {crb[0] * 1e3:>12.4f} | {crb[1] * 1e3:>16.4f} | {np.rad2deg(crb[2]):>15.6f} | {rel_Om:>13.4f}")
-
-
-# ============================================================
-# MAIN
-# ============================================================
-if __name__ == '__main__':
-    print("RPO-ISAC FIM Analysis — Full Pipeline")
-    print(f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"Parameters: f_c={PARAMS['f_c'] / 1e9:.0f} GHz, B={PARAMS['B'] / 1e6:.0f} MHz, "
-          f"P_t={PARAMS['P_t']} W, D={PARAMS['D_ant']} m")
-
-    total_t0 = time.time()
-
-    # Phase 1: Verify
-    ok = phase1_verify()
-    if not ok:
-        print("\n⚠️  Phase 1 failed. Fix before proceeding.")
-
-    # Phase 2: CRB curves (this takes a while)
-    phase2_crb_curves()
-
-    # Phase 3: Summary table
-    phase3_summary()
-
-    total_time = time.time() - total_t0
-    print(f"\n{'=' * 70}")
-    print(f"TOTAL RUNTIME: {total_time:.1f}s ({total_time / 60:.1f} min)")
-    print(f"{'=' * 70}")
+print("="*60)
+print(f"EuRAD 2026 Figures ({'FAST' if FAST else 'FULL'} mode)")
+print("="*60)
+T0=time.time()
+
+# --- DATA ---
+print("[Data] Fig 1: CRB vs distance...", end=' ', flush=True)
+t0=time.time()
+Npt=8 if FAST else 20
+darr=np.linspace(0.5e3,25e3,Npt)
+kcfgs=[(pk1,sk1,1),(pk2,sk2,2),(pk5,sk5,5),(pk10,sk10,10)]
+crb1={}
+for pk,sk,K in kcfgs:
+    crb1[K]=np.array([np.rad2deg(compute_crb(Pt,d,vr0,Om0,pk,sk)[2]) for d in darr])
+# Gaudio baseline + our CRB(d) for K=5
+crb1_gau_d=[]; crb1_d_K5=[]
+for d in darr:
+    aeff2=Pt*Gs**2*lam**2*np.sum(np.abs(sk5)**2)/((4*np.pi)**3*d**4*L)
+    crb1_gau_d.append(np.sqrt(6*sw2/(aeff2*(2*np.pi*Df)**2*N*M*(N**2-1)))*c/2*1e3)
+    crb1_d_K5.append(compute_crb(Pt,d,vr0,Om0,pk5,sk5)[0]*1e3)
+crb1_gau_d=np.array(crb1_gau_d); crb1_d_K5=np.array(crb1_d_K5)
+print(f"({time.time()-t0:.0f}s)")
+
+print("[Data] Fig 2: CRB vs K...", end=' ', flush=True)
+Karr=[1,2,3,5,8,10,15,20]; Nreal=3 if FAST else 10
+crb2_avg=[]; crb2_std=[]; crb2d_avg=[]
+for Kv in Karr:
+    vals=[np.rad2deg(compute_crb(Pt,5e3,vr0,Om0,*gen_target(Kv,100+s))[2]) for s in range(Nreal)]
+    dvals=[compute_crb(Pt,5e3,vr0,Om0,*gen_target(Kv,100+s))[0]*1e3 for s in range(Nreal)]
+    crb2_avg.append(np.mean(vals)); crb2_std.append(np.std(vals)); crb2d_avg.append(np.mean(dvals))
+crb2_avg=np.array(crb2_avg); crb2_std=np.array(crb2_std); crb2d_avg=np.array(crb2d_avg)
+print("done")
+
+print("[Data] Fig 3: BW & CPI...", end=' ', flush=True)
+t0=time.time()
+N_bak,M_bak,Df_bak,Ts_bak,sw2_bak=N,M,Df,Ts,sw2
+N_sw=128 if FAST else 256
+B_arr=[5e6,10e6,20e6,40e6,80e6]; crb3_B_Om=[]; crb3_B_d=[]
+for Bv in B_arr:
+    Df_v=Bv/N_sw; Ts_v=(1/Df_v)*1.25; M_v=max(1,min(200 if FAST else 800,int(0.05/Ts_v)))
+    N,M,Df,Ts=N_sw,M_v,Df_v,Ts_v; sw2=kB*Tss*Df_v
+    cr=compute_crb(Pt,5e3,vr0,Om0,pk5,sk5)
+    crb3_B_Om.append(np.rad2deg(cr[2])); crb3_B_d.append(cr[0]*1e3)
+N,M,Df,Ts,sw2=N_bak,M_bak,Df_bak,Ts_bak,sw2_bak
+crb3_B_Om=np.array(crb3_B_Om); crb3_B_d=np.array(crb3_B_d)
+Tcpi_arr=[5e-3,10e-3,20e-3,50e-3,100e-3,200e-3]; crb3_T_Om=[]; crb3_T_d=[]
+N_cpi=64; Df_cpi=B/1024; Ts_cpi=(1/Df_cpi)*1.25
+for Tv in Tcpi_arr:
+    M_v=max(1,int(Tv/Ts_cpi)); N,M,Df,Ts=N_cpi,M_v,Df_cpi,Ts_cpi; sw2=kB*Tss*Df_cpi
+    cr=compute_crb(Pt,5e3,vr0,Om0,pk5,sk5)
+    crb3_T_Om.append(np.rad2deg(cr[2])); crb3_T_d.append(cr[0]*1e3)
+N,M,Df,Ts,sw2=N_bak,M_bak,Df_bak,Ts_bak,sw2_bak
+crb3_T_Om=np.array(crb3_T_Om); crb3_T_d=np.array(crb3_T_d)
+print(f"({time.time()-t0:.0f}s)")
+
+print("[Data] Fig 4: Spin rate...", end=' ', flush=True)
+t0=time.time()
+N_s7=128 if FAST else 256; Df_s7=B/N_s7; Ts_s7=(1/Df_s7)*1.25
+M_s7=max(1,min(200 if FAST else 800,int(0.05/Ts_s7)))
+N,M,Df,Ts=N_s7,M_s7,Df_s7,Ts_s7; sw2=kB*Tss*Df_s7
+Om_deg=np.array([0.1,0.2,0.5,1,2,5,10,20]); Om_rad=np.deg2rad(Om_deg)
+crb4_Om=[]; crb4_rel=[]
+for Omv in Om_rad:
+    cr=compute_crb(Pt,5e3,vr0,Omv,pk5,sk5)
+    crb4_Om.append(np.rad2deg(cr[2])); crb4_rel.append(cr[2]/Omv*100)
+N,M,Df,Ts,sw2=N_bak,M_bak,Df_bak,Ts_bak,sw2_bak
+crb4_Om=np.array(crb4_Om); crb4_rel=np.array(crb4_rel)
+print(f"({time.time()-t0:.0f}s)")
+
+print("[Data] Fig 5: Link budget...", end=' ', flush=True)
+d_lb=np.linspace(0.5e3,30e3,100)
+snr_lb={}
+for Pv,Dv,lab in [(30,0.5,'30 W, $D$=0.5 m'),(100,0.5,'100 W, $D$=0.5 m'),(30,0.8,'30 W, $D$=0.8 m')]:
+    Gv=eta*(np.pi*Dv/lam)**2
+    snr_single=Pv*Gv**2*lam**2*10/((4*np.pi)**3*d_lb**4*L*kB*Tss*B)
+    snr_lb[lab]=10*np.log10(snr_single)+10*np.log10(M_bak)
+print("done")
+
+# --- PLOTS ---
+print("\n[Plotting]")
+
+# Fig 1: Two-panel CRB vs distance
+fig,(ax,axd)=plt.subplots(1,2,figsize=(IW*2+0.3,IH))
+for (pk,sk,K),(col,ls,mk) in zip(kcfgs,[(CB,'-','o'),(CR,'--','s'),(CG,'-.','^'),(CO,':','D')]):
+    ax.semilogy(darr/1e3,crb1[K],ls=ls,color=col,marker=mk,markevery=2,ms=3,label=f'$K={K}$')
+ax.set_xlabel('Distance $d$ [km]'); ax.set_ylabel(r'$\sqrt{\mathrm{CRB}(\Omega)}$ [deg/s]')
+ax.set_xlim([0.5,25]); ax.legend(loc='upper left',fontsize=6.5); ax.grid(True)
+ax.set_title('(a) Spin Rate CRB',fontsize=FS)
+idx10=np.argmin(np.abs(darr-10e3))
+if idx10<len(crb1[1]) and idx10<len(crb1[2]):
+    r12=crb1[1][idx10]/crb1[2][idx10]
+    ax.annotate('',xy=(darr[idx10]/1e3,crb1[2][idx10]),xytext=(darr[idx10]/1e3,crb1[1][idx10]),
+                arrowprops=dict(arrowstyle='<->',color=CR,lw=1))
+    ax.text(darr[idx10]/1e3+1.5,np.sqrt(crb1[1][idx10]*crb1[2][idx10]),
+            f'{r12:.0f}'+r'$\times$',fontsize=7,color=CR,fontweight='bold')
+axd.semilogy(darr/1e3,crb1_d_K5,'-^',color=CG,ms=3,markevery=2,lw=1.5,label='This work ($K$=5)')
+axd.semilogy(darr/1e3,crb1_gau_d,'--',color=CB,lw=1.5,label='Point target [7]')
+axd.set_xlabel('Distance $d$ [km]'); axd.set_ylabel(r'$\sqrt{\mathrm{CRB}(d)}$ [mm]')
+axd.set_xlim([0.5,25]); axd.legend(loc='upper left',fontsize=6.5); axd.grid(True)
+axd.set_title('(b) Range CRB vs [7]',fontsize=FS)
+plt.tight_layout(); savefig('fig1_crb_vs_distance')
+
+# Fig 2: CRB vs K
+fig,ax1=plt.subplots(figsize=(IW,IH))
+ax1.semilogy(Karr,crb2_avg,'-^',color=CG,ms=5,lw=1.5,label=r'CRB($\Omega$) [deg/s]')
+ax1.fill_between(Karr,np.maximum(crb2_avg-crb2_std,1e-8),crb2_avg+crb2_std,alpha=0.15,color=CG)
+ax1.set_xlabel('Number of scatterers $K$'); ax1.set_xticks(Karr)
+ax1.set_ylabel(r'$\sqrt{\mathrm{CRB}(\Omega)}$ [deg/s]',color=CG)
+ax1.tick_params(axis='y',labelcolor=CG); ax1.grid(True)
+ax2=ax1.twinx()
+ax2.semilogy(Karr,crb2d_avg,'-o',color=CB,ms=4,lw=1.5,label=r'CRB($d$) [mm]')
+ax2.set_ylabel(r'$\sqrt{\mathrm{CRB}(d)}$ [mm]',color=CB); ax2.tick_params(axis='y',labelcolor=CB)
+ax1.annotate(f'{crb2_avg[0]/crb2_avg[1]:.0f}'+r'$\times$',
+             xy=(1.5,np.sqrt(crb2_avg[0]*crb2_avg[1])),fontsize=7,color=CR,fontweight='bold',ha='center')
+l1,b1=ax1.get_legend_handles_labels(); l2,b2=ax2.get_legend_handles_labels()
+ax1.legend(l1+l2,b1+b2,loc='upper right',fontsize=6.5)
+savefig('fig2_crb_vs_K')
+
+# Fig 3: Design guidelines (BW + CPI)
+fig,(a1,a2)=plt.subplots(1,2,figsize=(IW*2+0.3,IH))
+a1.semilogy([b/1e6 for b in B_arr],crb3_B_Om,'-^',color=CG,ms=5,lw=1.5,label=r'CRB($\Omega$)')
+a1b=a1.twinx()
+a1b.semilogy([b/1e6 for b in B_arr],crb3_B_d,'-o',color=CB,ms=4,lw=1.5,label=r'CRB($d$)')
+a1.set_xlabel('Bandwidth [MHz]'); a1.set_ylabel(r'CRB($\Omega$) [deg/s]',color=CG)
+a1b.set_ylabel(r'CRB($d$) [mm]',color=CB)
+a1.tick_params(axis='y',labelcolor=CG); a1b.tick_params(axis='y',labelcolor=CB)
+a1.set_title('(a) $T_{\\mathrm{cpi}}$=50 ms',fontsize=FS)
+l1,b1=a1.get_legend_handles_labels(); l2,b2=a1b.get_legend_handles_labels()
+a1.legend(l1+l2,b1+b2,loc='upper right',fontsize=6); a1.grid(True)
+a2.semilogy([t*1e3 for t in Tcpi_arr],crb3_T_Om,'-^',color=CG,ms=5,lw=1.5,label=r'CRB($\Omega$)')
+a2b=a2.twinx()
+a2b.semilogy([t*1e3 for t in Tcpi_arr],crb3_T_d,'-o',color=CB,ms=4,lw=1.5,label=r'CRB($d$)')
+a2.set_xlabel('CPI Duration [ms]'); a2.set_ylabel(r'CRB($\Omega$) [deg/s]',color=CG)
+a2b.set_ylabel(r'CRB($d$) [mm]',color=CB)
+a2.tick_params(axis='y',labelcolor=CG); a2b.tick_params(axis='y',labelcolor=CB)
+a2.set_title('(b) $B$=20 MHz',fontsize=FS)
+l1,b1=a2.get_legend_handles_labels(); l2,b2=a2b.get_legend_handles_labels()
+a2.legend(l1+l2,b1+b2,loc='upper right',fontsize=6); a2.grid(True)
+plt.tight_layout(); savefig('fig3_design_guidelines')
+
+# Fig 4: CRB vs spin rate
+fig,ax1=plt.subplots(figsize=(IW,IH))
+ax1.loglog(Om_deg,crb4_Om,'-^',color=CG,ms=5,lw=1.5,label=r'CRB($\Omega$) [deg/s]')
+ax1.set_xlabel(r'Spin Rate $\Omega$ [deg/s]')
+ax1.set_ylabel(r'$\sqrt{\mathrm{CRB}(\Omega)}$ [deg/s]',color=CG)
+ax1.tick_params(axis='y',labelcolor=CG); ax1.grid(True,which='both',alpha=0.3)
+ax2r=ax1.twinx()
+ax2r.semilogx(Om_deg,crb4_rel,'-s',color=CR,ms=4,lw=1.5,label='Relative [%]')
+ax2r.set_ylabel(r'Relative CRB/$\Omega$ [%]',color=CR); ax2r.tick_params(axis='y',labelcolor=CR)
+l1,b1=ax1.get_legend_handles_labels(); l2,b2=ax2r.get_legend_handles_labels()
+ax1.legend(l1+l2,b1+b2,loc='upper left',fontsize=6.5)
+savefig('fig4_crb_vs_spinrate')
+
+# Fig 5: Link budget
+fig,ax=plt.subplots(figsize=(IW,IH))
+for lab,(col,ls) in zip(snr_lb.keys(),[(CB,'-'),(CR,'--'),(CG,'-.')]):
+    ax.plot(d_lb/1e3,snr_lb[lab],ls=ls,color=col,lw=1.5,label=lab)
+ax.axhline(10,color='gray',ls=':',lw=0.6); ax.text(27,12,'10 dB',fontsize=7,color='gray')
+ax.axhline(0,color='gray',ls='--',lw=0.6); ax.text(27,2,'0 dB',fontsize=7,color='gray')
+ax.axvspan(0.5,25,alpha=0.04,color=CB)
+ax.text(12,-15,'RPO range',fontsize=7,color=CB,ha='center',style='italic')
+ax.set_xlabel('Distance [km]'); ax.set_ylabel('SNR [dB] (50 ms CPI, $\\sigma$=10 m$^2$)')
+ax.set_xlim([0.5,30]); ax.set_ylim([-20,80])
+ax.legend(loc='upper right',fontsize=6.5); ax.grid(True)
+savefig('fig5_link_budget')
+
+# Composite
+fig,axes=plt.subplots(2,3,figsize=(14,8))
+for i,n in enumerate(['crb_vs_distance','crb_vs_K','design_guidelines','crb_vs_spinrate','link_budget']):
+    ax=axes.flat[i]; img=plt.imread(f'{FIG_DIR}/fig{i+1}_{n}.png')
+    ax.imshow(img); ax.set_title(f'Fig. {i+1}',fontsize=10); ax.axis('off')
+axes.flat[5].axis('off'); plt.tight_layout()
+fig.savefig(f'{FIG_DIR}/all_figures.png',dpi=150); plt.close()
+
+print(f"\nTotal: {time.time()-T0:.1f}s → {FIG_DIR}/")
