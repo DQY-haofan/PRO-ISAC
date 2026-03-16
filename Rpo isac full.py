@@ -106,13 +106,16 @@ crb1_gau_d=np.array(crb1_gau_d); crb1_d_K5=np.array(crb1_d_K5)
 print(f"({time.time()-t0:.0f}s)")
 
 print("[Data] Fig 2: CRB vs K...", end=' ', flush=True)
-Karr=[1,2,3,5,8,10,15,20]; Nreal=3 if FAST else 10
-crb2_avg=[]; crb2_std=[]; crb2d_avg=[]
+Karr=[1,2,3,5,8,10,15,20]; Nreal=5 if FAST else 30
+crb2_avg=[]; crb2_std=[]; crb2d_avg=[]; crb2d_std=[]
 for Kv in Karr:
     vals=[np.rad2deg(compute_crb(Pt,5e3,vr0,Om0,*gen_target(Kv,100+s))[2]) for s in range(Nreal)]
     dvals=[compute_crb(Pt,5e3,vr0,Om0,*gen_target(Kv,100+s))[0]*1e3 for s in range(Nreal)]
-    crb2_avg.append(np.mean(vals)); crb2_std.append(np.std(vals)); crb2d_avg.append(np.mean(dvals))
-crb2_avg=np.array(crb2_avg); crb2_std=np.array(crb2_std); crb2d_avg=np.array(crb2d_avg)
+    # Use median to handle ill-conditioned realizations at small K
+    crb2_avg.append(np.median(vals)); crb2_std.append(np.std(vals))
+    crb2d_avg.append(np.median(dvals)); crb2d_std.append(np.std(dvals))
+crb2_avg=np.array(crb2_avg); crb2_std=np.array(crb2_std)
+crb2d_avg=np.array(crb2d_avg); crb2d_std=np.array(crb2d_std)
 print("done")
 
 print("[Data] Fig 3: BW & CPI...", end=' ', flush=True)
@@ -158,6 +161,10 @@ for Pv,Dv,lab in [(30,0.5,'30 W, $D$=0.5 m'),(100,0.5,'100 W, $D$=0.5 m'),(30,0.
     Gv=eta*(np.pi*Dv/lam)**2
     snr_single=Pv*Gv**2*lam**2*10/((4*np.pi)**3*d_lb**4*L*kB*Tss*B)
     snr_lb[lab]=10*np.log10(snr_single)+10*np.log10(M_bak)
+# Also compute σ=1 m² for baseline
+Gv_base=eta*(np.pi*0.5/lam)**2
+snr_1m2=30*Gv_base**2*lam**2*1/((4*np.pi)**3*d_lb**4*L*kB*Tss*B)
+snr_lb_1m2=10*np.log10(snr_1m2)+10*np.log10(M_bak)
 print("done")
 
 # --- PLOTS ---
@@ -184,17 +191,19 @@ axd.set_xlim([0.5,25]); axd.legend(loc='upper left',fontsize=6.5); axd.grid(True
 axd.set_title('(b) Range CRB vs [7]',fontsize=FS)
 plt.tight_layout(); savefig('fig1_crb_vs_distance')
 
-# Fig 2: CRB vs K
+# Fig 2: CRB vs K (median + shading)
 fig,ax1=plt.subplots(figsize=(IW,IH))
 ax1.semilogy(Karr,crb2_avg,'-^',color=CG,ms=5,lw=1.5,label=r'CRB($\Omega$) [deg/s]')
-ax1.fill_between(Karr,np.maximum(crb2_avg-crb2_std,1e-8),crb2_avg+crb2_std,alpha=0.15,color=CG)
+ax1.fill_between(Karr,np.maximum(crb2_avg-crb2_std,1e-8),crb2_avg+crb2_std,alpha=0.12,color=CG)
 ax1.set_xlabel('Number of scatterers $K$'); ax1.set_xticks(Karr)
 ax1.set_ylabel(r'$\sqrt{\mathrm{CRB}(\Omega)}$ [deg/s]',color=CG)
 ax1.tick_params(axis='y',labelcolor=CG); ax1.grid(True)
 ax2=ax1.twinx()
 ax2.semilogy(Karr,crb2d_avg,'-o',color=CB,ms=4,lw=1.5,label=r'CRB($d$) [mm]')
+ax2.fill_between(Karr,np.maximum(crb2d_avg-crb2d_std,1e-2),crb2d_avg+crb2d_std,alpha=0.08,color=CB)
 ax2.set_ylabel(r'$\sqrt{\mathrm{CRB}(d)}$ [mm]',color=CB); ax2.tick_params(axis='y',labelcolor=CB)
-ax1.annotate(f'{crb2_avg[0]/crb2_avg[1]:.0f}'+r'$\times$',
+r12=crb2_avg[0]/crb2_avg[1]
+ax1.annotate(f'{r12:.0f}'+r'$\times$',
              xy=(1.5,np.sqrt(crb2_avg[0]*crb2_avg[1])),fontsize=7,color=CR,fontweight='bold',ha='center')
 l1,b1=ax1.get_legend_handles_labels(); l2,b2=ax2.get_legend_handles_labels()
 ax1.legend(l1+l2,b1+b2,loc='upper right',fontsize=6.5)
@@ -235,17 +244,18 @@ l1,b1=ax1.get_legend_handles_labels(); l2,b2=ax2r.get_legend_handles_labels()
 ax1.legend(l1+l2,b1+b2,loc='upper left',fontsize=6.5)
 savefig('fig4_crb_vs_spinrate')
 
-# Fig 5: Link budget
+# Fig 5: Link budget with σ=1 m² overlay
 fig,ax=plt.subplots(figsize=(IW,IH))
 for lab,(col,ls) in zip(snr_lb.keys(),[(CB,'-'),(CR,'--'),(CG,'-.')]):
-    ax.plot(d_lb/1e3,snr_lb[lab],ls=ls,color=col,lw=1.5,label=lab)
-ax.axhline(10,color='gray',ls=':',lw=0.6); ax.text(27,12,'10 dB',fontsize=7,color='gray')
-ax.axhline(0,color='gray',ls='--',lw=0.6); ax.text(27,2,'0 dB',fontsize=7,color='gray')
+    ax.plot(d_lb/1e3,snr_lb[lab],ls=ls,color=col,lw=1.5,label=lab+', $\\sigma$=10')
+ax.plot(d_lb/1e3,snr_lb_1m2,ls=':',color=CB,lw=1.0,label='30 W, $D$=0.5 m, $\\sigma$=1')
+ax.axhline(10,color='gray',ls=':',lw=0.6); ax.text(27,12,'10 dB',fontsize=6,color='gray')
+ax.axhline(0,color='gray',ls='--',lw=0.6); ax.text(27,2,'0 dB',fontsize=6,color='gray')
 ax.axvspan(0.5,25,alpha=0.04,color=CB)
 ax.text(12,-15,'RPO range',fontsize=7,color=CB,ha='center',style='italic')
-ax.set_xlabel('Distance [km]'); ax.set_ylabel('SNR [dB] (50 ms CPI, $\\sigma$=10 m$^2$)')
+ax.set_xlabel('Distance [km]'); ax.set_ylabel('SNR [dB] (50 ms CPI)')
 ax.set_xlim([0.5,30]); ax.set_ylim([-20,80])
-ax.legend(loc='upper right',fontsize=6.5); ax.grid(True)
+ax.legend(loc='upper right',fontsize=5.5,ncol=1); ax.grid(True)
 savefig('fig5_link_budget')
 
 # Composite
